@@ -4,7 +4,9 @@ finetune.py
 Fine-tunes OpenVLA via LoRA.
 """
 
+from src.motion_plugin import MotionPlugin, compute_motion_loss
 import os
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -61,6 +63,11 @@ from prismatic.vla.constants import (
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -116,6 +123,12 @@ class FinetuneConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
+
+    # PAGE motion auxiliary objective (plug-in)
+    motion_enabled: bool = False                     # If True, adds motion classification loss
+    motion_num_classes: Optional[int] = None         # Required when motion_enabled is True
+    motion_lambda: float = 0.1                       # Total loss = action_loss + motion_lambda * motion_loss
+    motion_head_hidden_dim: int = 0                  # 0 => single linear head; >0 => 2-layer MLP head
 
     # fmt: on
 
@@ -192,9 +205,11 @@ def load_checkpoint(module_name: str, path: str, step: int, device: str = "cpu")
     Returns:
         dict: PyTorch model state dictionary.
     """
-    checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
+    checkpoint_path = os.path.join(
+        path, f"{module_name}--{step}_checkpoint.pt")
     print(f"Loading checkpoint: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, weights_only=True, map_location=device)
+    state_dict = torch.load(
+        checkpoint_path, weights_only=True, map_location=device)
     return remove_ddp_in_checkpoint(state_dict)
 
 
@@ -256,7 +271,8 @@ def init_module(
     count_parameters(module, module_name)
 
     if cfg.resume:
-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
+        state_dict = load_checkpoint(
+            module_name, cfg.vla_path, cfg.resume_step)
         module.load_state_dict(state_dict)
 
     if to_bf16:
@@ -269,6 +285,7 @@ def init_module(
 def run_forward_pass(
     vla,
     action_head,
+    motion_head,
     noisy_action_projector,
     proprio_projector,
     batch,
@@ -279,6 +296,7 @@ def run_forward_pass(
     use_proprio,
     use_film,
     num_patches,
+    motion_lambda,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -314,7 +332,8 @@ def run_forward_pass(
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
     if use_diffusion:
-        noisy_dict = action_head.module.sample_noisy_actions(ground_truth_actions)
+        noisy_dict = action_head.module.sample_noisy_actions(
+            ground_truth_actions)
         noise, noisy_actions, diffusion_timestep_embeddings = (
             noisy_dict["noise"],
             noisy_dict["noisy_actions"],
@@ -328,7 +347,8 @@ def run_forward_pass(
         output: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            pixel_values=batch["pixel_values"].to(
+                torch.bfloat16).to(device_id),
             labels=batch["labels"],
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
@@ -346,7 +366,7 @@ def run_forward_pass(
 
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
-        loss = output.loss
+        action_loss = output.loss
         predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
             predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
@@ -362,7 +382,7 @@ def run_forward_pass(
         )
         metrics.update(
             {
-                "loss_value": loss.item(),  # Detached value for logging
+                "loss_value": action_loss.item(),  # Detached value for logging
                 "curr_action_accuracy": curr_action_accuracy.item(),
                 "curr_action_l1_loss": curr_action_l1_loss.item(),
                 "next_actions_accuracy": next_actions_accuracy.item(),
@@ -385,16 +405,19 @@ def run_forward_pass(
 
         if use_l1_regression:
             # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
+            predicted_actions = action_head.module.predict_action(
+                actions_hidden_states)
             # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            action_loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
         if use_diffusion:
             # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            noise_pred = action_head.module.predict_noise(
+                actions_hidden_states)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
-            loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
+            action_loss = nn.functional.mse_loss(
+                noise_pred, noise, reduction="mean")
 
             # Only sample actions and compute L1 losses if specified
             if compute_diffusion_l1:
@@ -417,19 +440,22 @@ def run_forward_pass(
 
         metrics.update(
             {
-                "loss_value": loss.item(),  # Detached value for logging
+                "loss_value": action_loss.item(),  # Detached value for logging
             }
         )
 
         # Get detailed L1 losses for logging
-        should_log_l1_loss = not use_diffusion or (use_diffusion and compute_diffusion_l1)
+        should_log_l1_loss = not use_diffusion or (
+            use_diffusion and compute_diffusion_l1)
         if should_log_l1_loss:
             ground_truth_curr_action = ground_truth_actions[:, 0]
             predicted_curr_action = predicted_actions[:, 0]
             ground_truth_next_actions = ground_truth_actions[:, 1:]
             predicted_next_actions = predicted_actions[:, 1:]
-            curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
-            next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
+            curr_action_l1_loss = torch.nn.L1Loss()(
+                ground_truth_curr_action, predicted_curr_action)
+            next_actions_l1_loss = torch.nn.L1Loss()(
+                ground_truth_next_actions, predicted_next_actions)
             metrics.update(
                 {
                     "curr_action_l1_loss": curr_action_l1_loss.item(),
@@ -437,8 +463,27 @@ def run_forward_pass(
                 }
             )
 
+    motion_loss, motion_valid_count = compute_motion_loss(
+        output_hidden_states=output.hidden_states[-1],
+        batch=batch,
+        device_id=device_id,
+        motion_head=motion_head,
+        loss_dtype=action_loss.dtype,
+    )
+
+    total_loss = action_loss + (motion_lambda * motion_loss)
+
+    metrics.update(
+        {
+            "motion_loss": float(motion_loss.detach().item()),
+            "motion_weighted_loss": float((motion_lambda * motion_loss).detach().item()),
+            "motion_valid_count": float(motion_valid_count),
+            "loss_value": float(total_loss.detach().item()),
+        }
+    )
+
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
-    return loss, metrics
+    return total_loss, metrics
 
 
 def run_diffusion_sampling(
@@ -485,7 +530,8 @@ def run_diffusion_sampling(
     )  # (B, chunk_len, action_dim)
 
     # Set diffusion timestep values
-    action_head.module.noise_scheduler.set_timesteps(action_head.module.num_diffusion_steps_train)
+    action_head.module.noise_scheduler.set_timesteps(
+        action_head.module.num_diffusion_steps_train)
 
     # Reverse diffusion: Iteratively denoise to generate action, conditioned on observation
     curr_noisy_actions = noise
@@ -494,15 +540,18 @@ def run_diffusion_sampling(
         # and diffusion timestep embedding)
         timesteps = torch.Tensor([t]).repeat(batch_size).to(device_id)
         diffusion_timestep_embeddings = (
-            action_head.module.time_encoder(timesteps).to(curr_noisy_actions.dtype).to(curr_noisy_actions.device)
+            action_head.module.time_encoder(timesteps).to(
+                curr_noisy_actions.dtype).to(curr_noisy_actions.device)
         )  # (B, llm_dim)
-        diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(1)  # (B, 1, llm_dim)
+        diffusion_timestep_embeddings = diffusion_timestep_embeddings.unsqueeze(
+            1)  # (B, 1, llm_dim)
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             output = vla(
                 input_ids=batch["input_ids"].to(device_id),
                 attention_mask=batch["attention_mask"].to(device_id),
-                pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                pixel_values=batch["pixel_values"].to(
+                    torch.bfloat16).to(device_id),
                 labels=batch["labels"],
                 output_hidden_states=True,
                 proprio=batch["proprio"] if use_proprio else None,
@@ -522,10 +571,12 @@ def run_diffusion_sampling(
             )  # (B, act_chunk_len, D)
             actions_hidden_states = actions_hidden_states.to(torch.bfloat16)
             # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            noise_pred = action_head.module.predict_noise(
+                actions_hidden_states)
 
         # Compute the action at the previous diffusion timestep: x_t -> x_{t-1}
-        curr_noisy_actions = action_head.module.noise_scheduler.step(noise_pred, t, curr_noisy_actions).prev_sample
+        curr_noisy_actions = action_head.module.noise_scheduler.step(
+            noise_pred, t, curr_noisy_actions).prev_sample
 
     return curr_noisy_actions.reshape(actions_shape)
 
@@ -580,6 +631,7 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
+    motion_head,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -615,7 +667,8 @@ def save_training_checkpoint(
     if distributed_state.is_main_process:
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(adapter_dir, exist_ok=True)
-        save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
+        save_dataset_statistics(
+            train_dataset.dataset_statistics, checkpoint_dir)
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
@@ -629,20 +682,28 @@ def save_training_checkpoint(
 
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
-            torch.save(proprio_projector.state_dict(), checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}")
+            torch.save(proprio_projector.state_dict(), checkpoint_dir /
+                       f"proprio_projector--{checkpoint_name_suffix}")
 
         if cfg.use_diffusion and noisy_action_projector is not None:
             torch.save(
-                noisy_action_projector.state_dict(), checkpoint_dir / f"noisy_action_projector--{checkpoint_name_suffix}"
+                noisy_action_projector.state_dict(), checkpoint_dir /
+                f"noisy_action_projector--{checkpoint_name_suffix}"
             )
 
         if (cfg.use_l1_regression or cfg.use_diffusion) and action_head is not None:
-            torch.save(action_head.state_dict(), checkpoint_dir / f"action_head--{checkpoint_name_suffix}")
+            torch.save(action_head.state_dict(), checkpoint_dir /
+                       f"action_head--{checkpoint_name_suffix}")
+
+        if motion_head is not None:
+            torch.save(motion_head.state_dict(), checkpoint_dir /
+                       f"motion_head--{checkpoint_name_suffix}")
 
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
-                vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
+                vla.module.vision_backbone.state_dict(), checkpoint_dir /
+                f"vision_backbone--{checkpoint_name_suffix}"
             )
 
     # Wait for model components to be saved
@@ -659,7 +720,8 @@ def save_training_checkpoint(
 
         if distributed_state.is_main_process:
             merged_vla.save_pretrained(checkpoint_dir)
-            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+            print(
+                f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
 
         # Wait for merged model to be saved
         dist.barrier()
@@ -668,6 +730,7 @@ def save_training_checkpoint(
 def run_validation(
     vla,
     action_head,
+    motion_head,
     noisy_action_projector,
     proprio_projector,
     val_dataloader,
@@ -678,6 +741,7 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
+    motion_lambda,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -712,6 +776,7 @@ def run_validation(
             _, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
+                motion_head=motion_head,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
                 batch=batch,
@@ -722,6 +787,7 @@ def run_validation(
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
+                motion_lambda=motion_lambda,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -738,7 +804,8 @@ def run_validation(
     # Compute average validation metrics
     avg_val_metrics = {}
     for metric_name in all_val_metrics[0].keys():
-        values = [metrics[metric_name] for metrics in all_val_metrics if metric_name in metrics]
+        values = [metrics[metric_name]
+                  for metrics in all_val_metrics if metric_name in metrics]
         if values:
             avg_val_metrics[metric_name] = sum(values) / len(values)
 
@@ -773,7 +840,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    print(f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
+    print(
+        f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
     # Get experiment run ID
     run_id = get_run_id(cfg)
@@ -790,7 +858,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
+        wandb.init(entity=cfg.wandb_entity,
+                   project=cfg.wandb_project, name=f"ft+{run_id}")
 
     # Print detected constants
     print(
@@ -820,7 +889,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         AutoConfig.register("openvla", OpenVLAConfig)
         AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-        AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+        AutoModelForVision2Seq.register(
+            OpenVLAConfig, OpenVLAForActionPrediction)
 
     # Update config.json and sync model files
     if distributed_state.is_main_process:
@@ -831,7 +901,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     dist.barrier()
 
     # Load processor and VLA
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        cfg.vla_path, trust_remote_code=True)
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
@@ -865,14 +936,20 @@ def finetune(cfg: FinetuneConfig) -> None:
             vision_backbone=vla.model.vision_backbone,
             llm_dim=vla.llm_dim,
         )
-        count_parameters(vla.vision_backbone, "vla.vision_backbone (post-wrap)")
+        count_parameters(vla.vision_backbone,
+                         "vla.vision_backbone (post-wrap)")
         if cfg.resume:
-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
+            state_dict = load_checkpoint(
+                "vision_backbone", cfg.vla_path, cfg.resume_step)
             vla.model.vision_backbone.load_state_dict(state_dict)
         vla.model.vision_backbone = vla.model.vision_backbone.to(device_id)
 
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
+
+    motion_plugin = MotionPlugin(cfg)
+    motion_head = motion_plugin.build_motion_head(
+        init_module, device_id, vla.module.llm_dim)
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -891,7 +968,8 @@ def finetune(cfg: FinetuneConfig) -> None:
             "action_head",
             cfg,
             device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+            {"input_dim": vla.module.llm_dim,
+                "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
             to_bf16=True,
         )
 
@@ -911,11 +989,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             to_bf16=True,
         )
         noisy_action_projector = init_module(
-            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {"llm_dim": vla.module.llm_dim}
+            NoisyActionProjector, "noisy_action_projector", cfg, device_id, {
+                "llm_dim": vla.module.llm_dim}
         )
 
     # Get number of vision patches
-    NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+    NUM_PATCHES = vla.module.vision_backbone.get_num_patches(
+    ) * vla.module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
@@ -924,14 +1004,22 @@ def finetune(cfg: FinetuneConfig) -> None:
         NUM_PATCHES += 1
 
     # Instantiate optimizer
-    trainable_params = [param for param in vla.parameters() if param.requires_grad]
+    trainable_params = [param for param in vla.parameters()
+                        if param.requires_grad]
     if cfg.use_l1_regression or cfg.use_diffusion:
-        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
+        trainable_params += [param for param in action_head.parameters()
+                             if param.requires_grad]
     if cfg.use_diffusion:
-        trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
+        trainable_params += [param for param in noisy_action_projector.parameters()
+                             if param.requires_grad]
     if cfg.use_proprio:
-        trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
-    print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+        trainable_params += [param for param in proprio_projector.parameters()
+                             if param.requires_grad]
+    if motion_head is not None:
+        trainable_params += [param for param in motion_head.parameters()
+                             if param.requires_grad]
+    print(
+        f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Record original learning rate
@@ -940,7 +1028,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Create learning rate scheduler
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
+        # Number of steps after which LR will change
+        milestones=[cfg.num_steps_before_decay],
         gamma=0.1,  # Multiplicative factor of learning rate decay
     )
 
@@ -1027,6 +1116,14 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    if motion_head is not None:
+        recent_metrics.update(
+            {
+                "motion_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "motion_weighted_loss": deque(maxlen=cfg.grad_accumulation_steps),
+                "motion_valid_count": deque(maxlen=cfg.grad_accumulation_steps),
+            }
+        )
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -1038,6 +1135,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
+                motion_head=motion_head,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
                 batch=batch,
@@ -1048,6 +1146,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
+                motion_lambda=motion_plugin.motion_lambda,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1072,11 +1171,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
-                log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
+                log_metrics_to_wandb(smoothened_metrics,
+                                     "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
             if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
+                lr_progress = min((gradient_step_idx + 1) /
+                                  cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_lr
@@ -1108,7 +1209,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                     processor=processor,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
-                    action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    action_head=action_head if (
+                        cfg.use_l1_regression or cfg.use_diffusion) else None,
+                    motion_head=motion_head,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
@@ -1118,6 +1221,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 run_validation(
                     vla=vla,
                     action_head=action_head,
+                    motion_head=motion_head,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     val_dataloader=val_dataloader,
@@ -1128,13 +1232,15 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
+                    motion_lambda=motion_plugin.motion_lambda,
                 )
                 # Set model back to training mode after validation
                 vla.train()
 
             # Stop training when max_steps is reached
             if log_step == cfg.max_steps:
-                print(f"Max step {cfg.max_steps} reached! Stopping training...")
+                print(
+                    f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
 
 
