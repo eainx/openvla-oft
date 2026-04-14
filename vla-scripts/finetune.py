@@ -3,27 +3,16 @@ finetune.py
 
 Fine-tunes OpenVLA via LoRA.
 """
-
-import os
-import sys
-import time
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from src.motion_plugin import MotionPlugin, compute_motion_loss
 from src.motion_data import (
     LiberoParquetMotionDataset,
     MotionClassResolver,
     PaddedCollatorForActionPredictionWithMotion,
     RLDSBatchTransformWithMotion,
 )
+from src.motion_plugin import MotionPlugin, compute_motion_loss
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Type
-
 import draccus
 import torch
 import torch.distributed as dist
@@ -38,15 +27,12 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
 import wandb
-
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
     update_auto_map,
 )
-
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -72,6 +58,10 @@ from prismatic.vla.constants import (
 )
 from prismatic.vla.datasets import RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from pathlib import Path
+import time
+import sys
+import os
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -138,7 +128,7 @@ class FinetuneConfig:
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
 
     # PAGE motion auxiliary objective (plug-in)
-    motion_enabled: bool = False                     # If True, adds motion classification loss
+    motion_enabled: bool = True                     # If True, adds motion classification loss
     motion_classes_path: Optional[Path] = Path("/home/eainx/workspace/dataset/cotracker_libero/motion_classes.pt")
     motion_lambda: float = 0.1                       # Total loss = action_loss + motion_lambda * motion_loss
     motion_num_classes: Optional[int] = None         # If None, infer from motion classes file when enabled
