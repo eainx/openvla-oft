@@ -78,7 +78,7 @@ class FinetuneConfig:
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
     use_libero_parquet_dataset: bool = True          # If True, use direct LIBERO parquet loader instead of RLDSDataset
-    libero_tracks_root: Path = Path("/home/eainx/workspace/dataset/cotracker_libero")
+    libero_tracks_root: Path = Path("/home/eainx/workspace/dataset/cotracker_libero_dense")
     libero_video_key: str = "image"                 # Must match LIBERO parquet image key and cotracker output folder
     libero_tasks_path: Path = Path("/home/eainx/workspace/dataset/libero/meta/tasks.jsonl")
     libero_stats_path: Path = Path("/home/eainx/workspace/dataset/libero/meta/stats.json")
@@ -93,6 +93,7 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    predict_stop_token: bool = True                  # If False, ignore stop token loss (matches RLDS option)
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -128,11 +129,17 @@ class FinetuneConfig:
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
 
     # PAGE motion auxiliary objective (plug-in)
-    motion_enabled: bool = True                     # If True, adds motion classification loss
-    motion_classes_path: Optional[Path] = Path("/home/eainx/workspace/dataset/cotracker_libero/motion_classes.pt")
-    motion_lambda: float = 0.1                       # Total loss = action_loss + motion_lambda * motion_loss
-    motion_num_classes: Optional[int] = None         # If None, infer from motion classes file when enabled
+    motion_enabled: bool = True                     # If True, adds motion auxiliary loss
+    motion_mode: str = "patch"                       # patch | class
+    motion_targets_root: Optional[Path] = Path("/home/eainx/workspace/dataset/page_motion_targets")
+    motion_t_future: int = 8
+    motion_patch_grid: Tuple[int, int] = (16, 16)
+    motion_lambda: float = 0.05                      # Total loss = action_loss + motion_lambda * motion_loss
     motion_head_hidden_dim: int = 0                  # 0 => single linear head; >0 => 2-layer MLP head
+
+    # Class-based motion (deprecated but kept for ablation)
+    motion_classes_path: Optional[Path] = Path("/home/eainx/workspace/dataset/cotracker_libero/motion_classes.pt")
+    motion_num_classes: Optional[int] = None         # If None, infer from motion classes file when enabled
     motion_require_label: bool = False               # If True, raise error when batch does not carry motion labels
     motion_fallback_to_task_majority: bool = True    # If episode label is missing, use majority class per task index
     motion_tasks_path: Optional[Path] = Path("/home/eainx/workspace/dataset/libero/meta/tasks.jsonl")
@@ -304,6 +311,8 @@ def run_forward_pass(
     use_film,
     num_patches,
     motion_lambda,
+    motion_mode,
+    motion_t_future,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -470,21 +479,48 @@ def run_forward_pass(
                 }
             )
 
-    motion_loss, motion_valid_count = compute_motion_loss(
-        output_hidden_states=output.hidden_states[-1],
-        batch=batch,
-        device_id=device_id,
-        motion_head=motion_head,
-        loss_dtype=action_loss.dtype,
-    )
+    motion_loss = torch.zeros((), device=device_id, dtype=action_loss.dtype)
+    motion_valid_frac = 0.0
+    if motion_head is not None:
+        if motion_mode == "patch" and "motion_target" in batch:
+            last_hidden = output.hidden_states[-1]
+            visual_hidden = last_hidden[:, :num_patches, :].to(torch.float32)
+            motion_pred = motion_head(visual_hidden)
+
+            motion_target = batch["motion_target"].to(device_id).float()
+            motion_mask = batch["motion_mask"].to(device_id).bool()
+            if motion_target.shape[2] != motion_t_future:
+                raise ValueError(
+                    "motion_target horizon mismatch: "
+                    f"target={motion_target.shape[2]} cfg={motion_t_future}"
+                )
+
+            diff = (motion_pred - motion_target).abs()
+            mask_expanded = motion_mask.unsqueeze(-1).float()
+            masked_diff = diff * mask_expanded
+            num_valid = mask_expanded.sum() * 2.0
+            motion_loss = masked_diff.sum() / (num_valid + 1e-8)
+            motion_valid_frac = float(motion_mask.float().mean().item())
+        elif motion_mode == "class":
+            motion_loss, motion_valid_count = compute_motion_loss(
+                output_hidden_states=output.hidden_states[-1],
+                batch=batch,
+                device_id=device_id,
+                motion_head=motion_head,
+                loss_dtype=action_loss.dtype,
+            )
+            motion_valid_frac = float(motion_valid_count) / max(
+                1, batch["input_ids"].shape[0]
+            )
 
     total_loss = action_loss + (motion_lambda * motion_loss)
 
     metrics.update(
         {
+            "action_loss": float(action_loss.detach().item()),
             "motion_loss": float(motion_loss.detach().item()),
             "motion_weighted_loss": float((motion_lambda * motion_loss).detach().item()),
-            "motion_valid_count": float(motion_valid_count),
+            "motion_valid_frac": float(motion_valid_frac),
             "loss_value": float(total_loss.detach().item()),
         }
     )
@@ -795,6 +831,8 @@ def run_validation(
                 use_film=cfg.use_film,
                 num_patches=num_patches,
                 motion_lambda=motion_lambda,
+                motion_mode=cfg.motion_mode,
+                motion_t_future=cfg.motion_t_future,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -844,10 +882,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
-    if cfg.motion_classes_path is None:
-        raise ValueError(
-            "motion_classes_path is required for LIBERO parquet training."
-        )
+    if cfg.motion_enabled:
+        if cfg.motion_mode == "class" and cfg.motion_classes_path is None:
+            raise ValueError(
+                "motion_classes_path is required for class motion mode."
+            )
+        if cfg.motion_mode == "patch" and cfg.motion_targets_root is None:
+            raise ValueError(
+                "motion_targets_root is required for patch motion mode."
+            )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
@@ -856,15 +899,27 @@ def finetune(cfg: FinetuneConfig) -> None:
     cfg.libero_tasks_path = cfg.libero_tasks_path.resolve()
     cfg.libero_stats_path = cfg.libero_stats_path.resolve()
     cfg.run_root_dir = cfg.run_root_dir.resolve()
-    cfg.motion_classes_path = cfg.motion_classes_path.resolve()
+    if cfg.motion_classes_path is not None:
+        cfg.motion_classes_path = cfg.motion_classes_path.resolve()
+    if cfg.motion_targets_root is not None:
+        cfg.motion_targets_root = cfg.motion_targets_root.resolve()
     if not cfg.data_root_dir.exists():
         raise FileNotFoundError(
             f"data_root_dir does not exist: {cfg.data_root_dir}"
         )
-    if not cfg.motion_classes_path.exists():
-        raise FileNotFoundError(
-            f"motion_classes_path does not exist: {cfg.motion_classes_path}"
-        )
+    if cfg.motion_enabled and cfg.motion_mode == "class":
+        if cfg.motion_classes_path is None or not cfg.motion_classes_path.exists():
+            raise FileNotFoundError(
+                f"motion_classes_path does not exist: {cfg.motion_classes_path}"
+            )
+    if cfg.motion_enabled and cfg.motion_mode == "patch":
+        if cfg.motion_targets_root is None or not cfg.motion_targets_root.exists():
+            raise FileNotFoundError(
+                f"motion_targets_root does not exist: {cfg.motion_targets_root}"
+            )
+        if not cfg.use_libero_parquet_dataset:
+            raise ValueError(
+                "patch motion mode requires use_libero_parquet_dataset=True")
     if cfg.motion_tasks_path is not None:
         cfg.motion_tasks_path = cfg.motion_tasks_path.resolve()
     print(
@@ -974,13 +1029,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 
-    motion_resolver = MotionClassResolver(
-        cfg.motion_classes_path,
-        fallback_to_task_majority=cfg.motion_fallback_to_task_majority,
-        tasks_path=cfg.motion_tasks_path,
-    )
-    if cfg.motion_enabled and cfg.motion_num_classes is None:
-        cfg.motion_num_classes = motion_resolver.num_classes
+    motion_resolver = None
+    if cfg.motion_enabled and cfg.motion_mode == "class":
+        motion_resolver = MotionClassResolver(
+            cfg.motion_classes_path,
+            fallback_to_task_majority=cfg.motion_fallback_to_task_majority,
+            tasks_path=cfg.motion_tasks_path,
+        )
+        if cfg.motion_num_classes is None:
+            cfg.motion_num_classes = motion_resolver.num_classes
 
     motion_plugin = MotionPlugin(cfg)
     motion_head = motion_plugin.build_motion_head(
@@ -1037,6 +1094,13 @@ def finetune(cfg: FinetuneConfig) -> None:
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
+    if cfg.motion_enabled and cfg.motion_mode == "patch":
+        expected_patches = cfg.motion_patch_grid[0] * cfg.motion_patch_grid[1]
+        if NUM_PATCHES != expected_patches:
+            print(
+                "[warn] motion_patch_grid does not match NUM_PATCHES: "
+                f"grid={cfg.motion_patch_grid} num_patches={NUM_PATCHES}"
+            )
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters()
@@ -1106,6 +1170,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             stats_path=cfg.libero_stats_path,
             use_proprio=cfg.use_proprio,
             use_wrist_image=use_wrist_image,
+            image_aug=cfg.image_aug,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            predict_stop_token=cfg.predict_stop_token,
+            motion_mode=cfg.motion_mode,
+            motion_targets_root=cfg.motion_targets_root,
+            motion_t_future=cfg.motion_t_future,
+            motion_patch_grid=cfg.motion_patch_grid,
             max_samples=cfg.libero_max_samples,
             split="train",
             val_ratio=cfg.libero_val_ratio,
@@ -1126,6 +1197,13 @@ def finetune(cfg: FinetuneConfig) -> None:
                 stats_path=cfg.libero_stats_path,
                 use_proprio=cfg.use_proprio,
                 use_wrist_image=use_wrist_image,
+                image_aug=False,
+                resize_resolution=tuple(vla.module.config.image_sizes),
+                predict_stop_token=cfg.predict_stop_token,
+                motion_mode=cfg.motion_mode,
+                motion_targets_root=cfg.motion_targets_root,
+                motion_t_future=cfg.motion_t_future,
+                motion_patch_grid=cfg.motion_patch_grid,
                 max_samples=cfg.libero_max_samples,
                 split="val",
                 val_ratio=cfg.libero_val_ratio,
@@ -1189,6 +1267,7 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
         "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
+        "action_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1199,7 +1278,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             {
                 "motion_loss": deque(maxlen=cfg.grad_accumulation_steps),
                 "motion_weighted_loss": deque(maxlen=cfg.grad_accumulation_steps),
-                "motion_valid_count": deque(maxlen=cfg.grad_accumulation_steps),
+                "motion_valid_frac": deque(maxlen=cfg.grad_accumulation_steps),
             }
         )
 
@@ -1225,6 +1304,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
                 motion_lambda=motion_plugin.motion_lambda,
+                motion_mode=cfg.motion_mode,
+                motion_t_future=cfg.motion_t_future,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
