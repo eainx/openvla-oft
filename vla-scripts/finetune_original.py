@@ -3,16 +3,14 @@ finetune.py
 
 Fine-tunes OpenVLA via LoRA.
 """
-from src.motion_data import (
-    LiberoParquetMotionDataset,
-    MotionClassResolver,
-    PaddedCollatorForActionPredictionWithMotion,
-    RLDSBatchTransformWithMotion,
-)
-from src.motion_plugin import MotionPlugin, compute_motion_loss
+
+import os
+import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Tuple, Type
+
 import draccus
 import torch
 import torch.distributed as dist
@@ -27,12 +25,15 @@ from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
 import wandb
+
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
     model_is_on_hf_hub,
     update_auto_map,
 )
+
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -49,6 +50,7 @@ from prismatic.training.train_utils import (
     get_current_action_mask,
     get_next_actions_mask,
 )
+from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.constants import (
     ACTION_DIM,
@@ -56,13 +58,8 @@ from prismatic.vla.constants import (
     NUM_ACTIONS_CHUNK,
     PROPRIO_DIM,
 )
-from prismatic.vla.datasets import RLDSDataset
-from prismatic.util.data_utils import PaddedCollatorForActionPrediction
+from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-from pathlib import Path
-import time
-import sys
-import os
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -74,19 +71,10 @@ class FinetuneConfig:
     vla_path: str = "openvla/openvla-7b"             # Path to OpenVLA model (on HuggingFace Hub or stored locally)
 
     # Dataset
-    data_root_dir: Path = Path("/home/eainx/workspace/dataset/libero")      # Directory containing LIBERO parquet data
-    dataset_name: str = "libero_4_task_suites_no_noops"    # Dataset key used in logs/run-id
+    data_root_dir: Path = Path("datasets/rlds")      # Directory containing RLDS datasets
+    dataset_name: str = "aloha_scoop_x_into_bowl"    # Name of fine-tuning dataset (e.g., `aloha_scoop_x_into_bowl`)
     run_root_dir: Path = Path("runs")                # Path to directory to store logs & checkpoints
     shuffle_buffer_size: int = 100_000               # Dataloader shuffle buffer size (can reduce if OOM errors occur)
-    use_libero_parquet_dataset: bool = True          # If True, use direct LIBERO parquet loader instead of RLDSDataset
-    use_original_rlds_pipeline: bool = False         # If True, use original RLDS pipeline without motion
-    libero_tracks_root: Path = Path("/home/eainx/workspace/dataset/cotracker_libero_dense")
-    libero_video_key: str = "image"                 # Must match LIBERO parquet image key and cotracker output folder
-    libero_tasks_path: Path = Path("/home/eainx/workspace/dataset/libero/meta/tasks.jsonl")
-    libero_stats_path: Path = Path("/home/eainx/workspace/dataset/libero/meta/stats.json")
-    libero_max_samples: Optional[int] = None         # Optional cap for quick debugging
-    libero_val_ratio: float = 0.0                    # Optional held-out episode ratio for validation
-    libero_split_seed: int = 0
 
     # Algorithm and architecture
     use_l1_regression: bool = True                   # If True, trains continuous action head with L1 regression objective
@@ -95,7 +83,6 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
-    predict_stop_token: bool = True                  # If False, ignore stop token loss (matches RLDS option)
 
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
@@ -124,27 +111,11 @@ class FinetuneConfig:
                                                      #         False and merge final checkpoint offline!
 
     # Logging
-    wandb_entity: str = "eainx-korea-university"          # Name of WandB entity
-    wandb_project: str = "page-openvla-oft"        # Name of WandB project
+    wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
+    wandb_project: str = "your-wandb-project"        # Name of WandB project
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     run_id_override: Optional[str] = None            # Optional string to override the run ID with
     wandb_log_freq: int = 10                         # WandB logging frequency in steps
-
-    # PAGE motion auxiliary objective (plug-in)
-    motion_enabled: bool = True                     # If True, adds motion auxiliary loss
-    motion_mode: str = "patch"                       # patch | class
-    motion_targets_root: Optional[Path] = Path("/home/eainx/workspace/dataset/page_motion_targets")
-    motion_t_future: int = 8
-    motion_patch_grid: Tuple[int, int] = (16, 16)
-    motion_lambda: float = 0.05                      # Total loss = action_loss + motion_lambda * motion_loss
-    motion_head_hidden_dim: int = 0                  # 0 => single linear head; >0 => 2-layer MLP head
-
-    # Class-based motion (deprecated but kept for ablation)
-    motion_classes_path: Optional[Path] = Path("/home/eainx/workspace/dataset/cotracker_libero/motion_classes.pt")
-    motion_num_classes: Optional[int] = None         # If None, infer from motion classes file when enabled
-    motion_require_label: bool = False               # If True, raise error when batch does not carry motion labels
-    motion_fallback_to_task_majority: bool = True    # If episode label is missing, use majority class per task index
-    motion_tasks_path: Optional[Path] = Path("/home/eainx/workspace/dataset/libero/meta/tasks.jsonl")
 
     # fmt: on
 
@@ -301,7 +272,6 @@ def init_module(
 def run_forward_pass(
     vla,
     action_head,
-    motion_head,
     noisy_action_projector,
     proprio_projector,
     batch,
@@ -312,9 +282,6 @@ def run_forward_pass(
     use_proprio,
     use_film,
     num_patches,
-    motion_lambda,
-    motion_mode,
-    motion_t_future,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
@@ -384,7 +351,7 @@ def run_forward_pass(
 
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
-        action_loss = output.loss
+        loss = output.loss
         predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
             predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
@@ -400,7 +367,7 @@ def run_forward_pass(
         )
         metrics.update(
             {
-                "loss_value": action_loss.item(),  # Detached value for logging
+                "loss_value": loss.item(),  # Detached value for logging
                 "curr_action_accuracy": curr_action_accuracy.item(),
                 "curr_action_l1_loss": curr_action_l1_loss.item(),
                 "next_actions_accuracy": next_actions_accuracy.item(),
@@ -426,7 +393,7 @@ def run_forward_pass(
             predicted_actions = action_head.module.predict_action(
                 actions_hidden_states)
             # Get full L1 loss
-            action_loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
 
         if use_diffusion:
             # Predict noise
@@ -434,8 +401,7 @@ def run_forward_pass(
                 actions_hidden_states)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
-            action_loss = nn.functional.mse_loss(
-                noise_pred, noise, reduction="mean")
+            loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
 
             # Only sample actions and compute L1 losses if specified
             if compute_diffusion_l1:
@@ -458,7 +424,7 @@ def run_forward_pass(
 
         metrics.update(
             {
-                "loss_value": action_loss.item(),  # Detached value for logging
+                "loss_value": loss.item(),  # Detached value for logging
             }
         )
 
@@ -481,54 +447,8 @@ def run_forward_pass(
                 }
             )
 
-    motion_loss = torch.zeros((), device=device_id, dtype=action_loss.dtype)
-    motion_valid_frac = 0.0
-    if motion_head is not None:
-        if motion_mode == "patch" and "motion_target" in batch:
-            last_hidden = output.hidden_states[-1]
-            visual_hidden = last_hidden[:, :num_patches, :].to(torch.float32)
-            motion_pred = motion_head(visual_hidden)
-
-            motion_target = batch["motion_target"].to(device_id).float()
-            motion_mask = batch["motion_mask"].to(device_id).bool()
-            if motion_target.shape[2] != motion_t_future:
-                raise ValueError(
-                    "motion_target horizon mismatch: "
-                    f"target={motion_target.shape[2]} cfg={motion_t_future}"
-                )
-
-            diff = (motion_pred - motion_target).abs()
-            mask_expanded = motion_mask.unsqueeze(-1).float()
-            masked_diff = diff * mask_expanded
-            num_valid = mask_expanded.sum() * 2.0
-            motion_loss = masked_diff.sum() / (num_valid + 1e-8)
-            motion_valid_frac = float(motion_mask.float().mean().item())
-        elif motion_mode == "class":
-            motion_loss, motion_valid_count = compute_motion_loss(
-                output_hidden_states=output.hidden_states[-1],
-                batch=batch,
-                device_id=device_id,
-                motion_head=motion_head,
-                loss_dtype=action_loss.dtype,
-            )
-            motion_valid_frac = float(motion_valid_count) / max(
-                1, batch["input_ids"].shape[0]
-            )
-
-    total_loss = action_loss + (motion_lambda * motion_loss)
-
-    metrics.update(
-        {
-            "action_loss": float(action_loss.detach().item()),
-            "motion_loss": float(motion_loss.detach().item()),
-            "motion_weighted_loss": float((motion_lambda * motion_loss).detach().item()),
-            "motion_valid_frac": float(motion_valid_frac),
-            "loss_value": float(total_loss.detach().item()),
-        }
-    )
-
     # Return both the loss tensor (with gradients) and the metrics dictionary (with detached values)
-    return total_loss, metrics
+    return loss, metrics
 
 
 def run_diffusion_sampling(
@@ -676,7 +596,6 @@ def save_training_checkpoint(
     proprio_projector,
     noisy_action_projector,
     action_head,
-    motion_head,
     train_dataset,
     distributed_state,
 ) -> None:
@@ -740,10 +659,6 @@ def save_training_checkpoint(
             torch.save(action_head.state_dict(), checkpoint_dir /
                        f"action_head--{checkpoint_name_suffix}")
 
-        if motion_head is not None:
-            torch.save(motion_head.state_dict(), checkpoint_dir /
-                       f"motion_head--{checkpoint_name_suffix}")
-
         if cfg.use_film:
             # To be safe, just save the entire vision backbone (not just FiLM components)
             torch.save(
@@ -775,7 +690,6 @@ def save_training_checkpoint(
 def run_validation(
     vla,
     action_head,
-    motion_head,
     noisy_action_projector,
     proprio_projector,
     val_dataloader,
@@ -786,7 +700,6 @@ def run_validation(
     log_step,
     distributed_state,
     val_time_limit,
-    motion_lambda,
 ) -> None:
     """
     Compute validation set metrics for logging.
@@ -821,7 +734,6 @@ def run_validation(
             _, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
-                motion_head=motion_head,
                 noisy_action_projector=noisy_action_projector,
                 proprio_projector=proprio_projector,
                 batch=batch,
@@ -832,9 +744,6 @@ def run_validation(
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=num_patches,
-                motion_lambda=motion_lambda,
-                motion_mode=cfg.motion_mode,
-                motion_t_future=cfg.motion_t_future,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -884,50 +793,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
-    if cfg.motion_enabled and not cfg.use_original_rlds_pipeline:
-        if cfg.motion_mode == "class" and cfg.motion_classes_path is None:
-            raise ValueError(
-                "motion_classes_path is required for class motion mode."
-            )
-        if cfg.motion_mode == "patch" and cfg.motion_targets_root is None:
-            raise ValueError(
-                "motion_targets_root is required for patch motion mode."
-            )
-    if cfg.use_original_rlds_pipeline and cfg.motion_enabled:
-        raise ValueError(
-            "use_original_rlds_pipeline=True requires motion_enabled=False."
-        )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    cfg.data_root_dir = cfg.data_root_dir.resolve()
-    cfg.libero_tracks_root = cfg.libero_tracks_root.resolve()
-    cfg.libero_tasks_path = cfg.libero_tasks_path.resolve()
-    cfg.libero_stats_path = cfg.libero_stats_path.resolve()
-    cfg.run_root_dir = cfg.run_root_dir.resolve()
-    if cfg.motion_classes_path is not None:
-        cfg.motion_classes_path = cfg.motion_classes_path.resolve()
-    if cfg.motion_targets_root is not None:
-        cfg.motion_targets_root = cfg.motion_targets_root.resolve()
-    if not cfg.data_root_dir.exists():
-        raise FileNotFoundError(
-            f"data_root_dir does not exist: {cfg.data_root_dir}"
-        )
-    if cfg.motion_enabled and not cfg.use_original_rlds_pipeline and cfg.motion_mode == "class":
-        if cfg.motion_classes_path is None or not cfg.motion_classes_path.exists():
-            raise FileNotFoundError(
-                f"motion_classes_path does not exist: {cfg.motion_classes_path}"
-            )
-    if cfg.motion_enabled and not cfg.use_original_rlds_pipeline and cfg.motion_mode == "patch":
-        if cfg.motion_targets_root is None or not cfg.motion_targets_root.exists():
-            raise FileNotFoundError(
-                f"motion_targets_root does not exist: {cfg.motion_targets_root}"
-            )
-        if not cfg.use_libero_parquet_dataset:
-            raise ValueError(
-                "patch motion mode requires use_libero_parquet_dataset=True")
-    if cfg.motion_tasks_path is not None:
-        cfg.motion_tasks_path = cfg.motion_tasks_path.resolve()
     print(
         f"Fine-tuning OpenVLA Model `{cfg.vla_path}` on `{cfg.dataset_name}`")
 
@@ -1035,23 +903,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
 
-    motion_resolver = None
-    motion_plugin = None
-    motion_head = None
-    if cfg.motion_enabled and not cfg.use_original_rlds_pipeline:
-        if cfg.motion_mode == "class":
-            motion_resolver = MotionClassResolver(
-                cfg.motion_classes_path,
-                fallback_to_task_majority=cfg.motion_fallback_to_task_majority,
-                tasks_path=cfg.motion_tasks_path,
-            )
-            if cfg.motion_num_classes is None:
-                cfg.motion_num_classes = motion_resolver.num_classes
-
-        motion_plugin = MotionPlugin(cfg)
-        motion_head = motion_plugin.build_motion_head(
-            init_module, device_id, vla.module.llm_dim)
-
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
         proprio_projector = init_module(
@@ -1103,13 +954,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
-    if cfg.motion_enabled and not cfg.use_original_rlds_pipeline and cfg.motion_mode == "patch":
-        expected_patches = cfg.motion_patch_grid[0] * cfg.motion_patch_grid[1]
-        if NUM_PATCHES != expected_patches:
-            print(
-                "[warn] motion_patch_grid does not match NUM_PATCHES: "
-                f"grid={cfg.motion_patch_grid} num_patches={NUM_PATCHES}"
-            )
 
     # Instantiate optimizer
     trainable_params = [param for param in vla.parameters()
@@ -1122,9 +966,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                              if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters()
-                             if param.requires_grad]
-    if motion_head is not None:
-        trainable_params += [param for param in motion_head.parameters()
                              if param.requires_grad]
     print(
         f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
@@ -1164,157 +1005,41 @@ def finetune(cfg: FinetuneConfig) -> None:
     use_wrist_image = cfg.num_images_in_input > 1
 
     # Create training and optional validation datasets
-    if cfg.use_original_rlds_pipeline:
-        train_dataset = LiberoParquetMotionDataset(
-            dataset_root=cfg.data_root_dir,
-            dataset_name=cfg.dataset_name,
-            video_key=cfg.libero_video_key,
-            action_tokenizer=action_tokenizer,
-            base_tokenizer=processor.tokenizer,
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder,
-            motion_resolver=None,
-            require_motion_label=False,
-            tasks_path=cfg.libero_tasks_path,
-            stats_path=cfg.libero_stats_path,
-            use_proprio=cfg.use_proprio,
-            use_wrist_image=use_wrist_image,
-            image_aug=cfg.image_aug,
-            resize_resolution=tuple(vla.module.config.image_sizes),
-            predict_stop_token=cfg.predict_stop_token,
-            motion_mode="none",
-            motion_targets_root=None,
-            motion_t_future=cfg.motion_t_future,
-            motion_patch_grid=cfg.motion_patch_grid,
-            max_samples=cfg.libero_max_samples,
-            split="train",
-            val_ratio=cfg.libero_val_ratio,
-            split_seed=cfg.libero_split_seed,
-        )
-        if cfg.use_val_set:
-            val_dataset = LiberoParquetMotionDataset(
-                dataset_root=cfg.data_root_dir,
-                dataset_name=cfg.dataset_name,
-                video_key=cfg.libero_video_key,
-                action_tokenizer=action_tokenizer,
-                base_tokenizer=processor.tokenizer,
-                image_transform=processor.image_processor.apply_transform,
-                prompt_builder_fn=PurePromptBuilder,
-                motion_resolver=None,
-                require_motion_label=False,
-                tasks_path=cfg.libero_tasks_path,
-                stats_path=cfg.libero_stats_path,
-                use_proprio=cfg.use_proprio,
-                use_wrist_image=use_wrist_image,
-                image_aug=False,
-                resize_resolution=tuple(vla.module.config.image_sizes),
-                predict_stop_token=cfg.predict_stop_token,
-                motion_mode="none",
-                motion_targets_root=None,
-                motion_t_future=cfg.motion_t_future,
-                motion_patch_grid=cfg.motion_patch_grid,
-                max_samples=cfg.libero_max_samples,
-                split="val",
-                val_ratio=cfg.libero_val_ratio,
-                split_seed=cfg.libero_split_seed,
-            )
-    elif cfg.use_libero_parquet_dataset:
-        train_dataset = LiberoParquetMotionDataset(
-            dataset_root=cfg.data_root_dir,
-            dataset_name=cfg.dataset_name,
-            video_key=cfg.libero_video_key,
-            action_tokenizer=action_tokenizer,
-            base_tokenizer=processor.tokenizer,
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder,
-            motion_resolver=motion_resolver,
-            require_motion_label=cfg.motion_require_label,
-            tasks_path=cfg.libero_tasks_path,
-            stats_path=cfg.libero_stats_path,
-            use_proprio=cfg.use_proprio,
-            use_wrist_image=use_wrist_image,
-            image_aug=cfg.image_aug,
-            resize_resolution=tuple(vla.module.config.image_sizes),
-            predict_stop_token=cfg.predict_stop_token,
-            motion_mode=cfg.motion_mode,
-            motion_targets_root=cfg.motion_targets_root,
-            motion_t_future=cfg.motion_t_future,
-            motion_patch_grid=cfg.motion_patch_grid,
-            max_samples=cfg.libero_max_samples,
-            split="train",
-            val_ratio=cfg.libero_val_ratio,
-            split_seed=cfg.libero_split_seed,
-        )
-        if cfg.use_val_set:
-            val_dataset = LiberoParquetMotionDataset(
-                dataset_root=cfg.data_root_dir,
-                dataset_name=cfg.dataset_name,
-                video_key=cfg.libero_video_key,
-                action_tokenizer=action_tokenizer,
-                base_tokenizer=processor.tokenizer,
-                image_transform=processor.image_processor.apply_transform,
-                prompt_builder_fn=PurePromptBuilder,
-                motion_resolver=motion_resolver,
-                require_motion_label=cfg.motion_require_label,
-                tasks_path=cfg.libero_tasks_path,
-                stats_path=cfg.libero_stats_path,
-                use_proprio=cfg.use_proprio,
-                use_wrist_image=use_wrist_image,
-                image_aug=False,
-                resize_resolution=tuple(vla.module.config.image_sizes),
-                predict_stop_token=cfg.predict_stop_token,
-                motion_mode=cfg.motion_mode,
-                motion_targets_root=cfg.motion_targets_root,
-                motion_t_future=cfg.motion_t_future,
-                motion_patch_grid=cfg.motion_patch_grid,
-                max_samples=cfg.libero_max_samples,
-                split="val",
-                val_ratio=cfg.libero_val_ratio,
-                split_seed=cfg.libero_split_seed,
-            )
-    else:
-        batch_transform = RLDSBatchTransformWithMotion(
-            action_tokenizer,
-            processor.tokenizer,
-            image_transform=processor.image_processor.apply_transform,
-            prompt_builder_fn=PurePromptBuilder,
-            use_wrist_image=use_wrist_image,
-            use_proprio=cfg.use_proprio,
-            motion_resolver=motion_resolver,
-            motion_require_label=cfg.motion_require_label,
-        )
-        train_dataset = RLDSDataset(
+    batch_transform = RLDSBatchTransform(
+        action_tokenizer,
+        processor.tokenizer,
+        image_transform=processor.image_processor.apply_transform,
+        prompt_builder_fn=PurePromptBuilder,
+        use_wrist_image=use_wrist_image,
+        use_proprio=cfg.use_proprio,
+    )
+    train_dataset = RLDSDataset(
+        cfg.data_root_dir,
+        cfg.dataset_name,
+        batch_transform,
+        resize_resolution=tuple(vla.module.config.image_sizes),
+        shuffle_buffer_size=cfg.shuffle_buffer_size,
+        image_aug=cfg.image_aug,
+    )
+    if cfg.use_val_set:
+        val_dataset = RLDSDataset(
             cfg.data_root_dir,
             cfg.dataset_name,
             batch_transform,
             resize_resolution=tuple(vla.module.config.image_sizes),
-            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
+            train=False,
         )
-        if cfg.use_val_set:
-            val_dataset = RLDSDataset(
-                cfg.data_root_dir,
-                cfg.dataset_name,
-                batch_transform,
-                resize_resolution=tuple(vla.module.config.image_sizes),
-                shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
-                image_aug=cfg.image_aug,
-                train=False,
-            )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
 
     # Create collator and dataloader
-    if cfg.use_original_rlds_pipeline:
-        collator = PaddedCollatorForActionPrediction(
-            processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
-        )
-    else:
-        collator = PaddedCollatorForActionPredictionWithMotion(
-            processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
-        )
+    collator = PaddedCollatorForActionPrediction(
+        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
+    )
     dataloader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
@@ -1335,20 +1060,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
         "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
-        "action_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
-    if motion_head is not None:
-        recent_metrics.update(
-            {
-                "motion_loss": deque(maxlen=cfg.grad_accumulation_steps),
-                "motion_weighted_loss": deque(maxlen=cfg.grad_accumulation_steps),
-                "motion_valid_frac": deque(maxlen=cfg.grad_accumulation_steps),
-            }
-        )
 
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
@@ -1360,7 +1076,6 @@ def finetune(cfg: FinetuneConfig) -> None:
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
-                motion_head=motion_head,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
                 batch=batch,
@@ -1371,9 +1086,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_proprio=cfg.use_proprio,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
-                motion_lambda=motion_plugin.motion_lambda if motion_plugin else 0.0,
-                motion_mode=cfg.motion_mode,
-                motion_t_future=cfg.motion_t_future,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
             )
@@ -1438,7 +1150,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (
                         cfg.use_l1_regression or cfg.use_diffusion) else None,
-                    motion_head=motion_head,
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                 )
@@ -1448,7 +1159,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 run_validation(
                     vla=vla,
                     action_head=action_head,
-                    motion_head=motion_head,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
                     val_dataloader=val_dataloader,
@@ -1459,7 +1169,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                     log_step=log_step,
                     distributed_state=distributed_state,
                     val_time_limit=cfg.val_time_limit,
-                    motion_lambda=motion_plugin.motion_lambda if motion_plugin else 0.0,
                 )
                 # Set model back to training mode after validation
                 vla.train()
