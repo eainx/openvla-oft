@@ -12,6 +12,7 @@ from src.motion_data import (
 from src.motion_plugin import MotionPlugin, compute_motion_loss
 from collections import deque
 from dataclasses import dataclass
+import itertools
 from typing import Dict, Optional, Tuple, Type
 import draccus
 import torch
@@ -1297,9 +1298,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
+        dataloader_iter = iter(dataloader)
+        global_batch_idx = 0
+        while True:
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(dataloader)
+                batch = next(dataloader_iter)
             # Compute training metrics and loss
-            compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
+            compute_diffusion_l1 = cfg.use_diffusion and global_batch_idx % cfg.diffusion_sample_freq == 0
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
@@ -1333,7 +1341,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     recent_metrics[metric_name].append(value)
 
             # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            gradient_step_idx = global_batch_idx // cfg.grad_accumulation_steps
 
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
@@ -1363,7 +1371,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
 
             # Optimizer and LR scheduler step
-            if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
+            if (global_batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -1413,6 +1421,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 print(
                     f"Max step {cfg.max_steps} reached! Stopping training...")
                 break
+
+            global_batch_idx += 1
 
 
 if __name__ == "__main__":
